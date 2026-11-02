@@ -58,6 +58,7 @@ from lerobot.common.train_utils import (
     should_save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.common.swanlab_utils import SwanLabLogger
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import EvalConfig, JobConfig, parser
 from lerobot.configs.rewards import RewardModelConfig
@@ -330,6 +331,11 @@ def update_policy(
     if accelerator.scaler is not None and "grad_scale" in train_metrics.metrics:
         train_metrics.grad_scale = accelerator.scaler.get_scale()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
+    for param_group in optimizer.param_groups:
+        group_name = param_group.get("group_name")
+        metric_name = f"lr/{group_name}"
+        if group_name is not None and metric_name in train_metrics.metrics:
+            setattr(train_metrics, metric_name, param_group["lr"])
     train_metrics.update_s = time.perf_counter() - start_time
     if torch.cuda.is_available() and "gpu_mem_gb" in train_metrics.metrics:
         train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
@@ -581,11 +587,16 @@ def train(cfg: TrainPipelineConfig) -> None:
     if is_main_process():
         logging.info(pformat(cfg.to_dict()))
 
+    if cfg.swanlab.enable and is_main_process():
+        swanlab_logger = SwanLabLogger(cfg)
+    else:
+        swanlab_logger = None
+
     if cfg.wandb.enable and cfg.wandb.project and is_main_process():
         wandb_logger = WandBLogger(cfg)
     else:
         wandb_logger = None
-        if is_main_process():
+        if is_main_process() and swanlab_logger is None:
             logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
     if cfg.seed is not None:
@@ -890,6 +901,11 @@ def train(cfg: TrainPipelineConfig) -> None:
         "step_s": AverageMeter("step_s", ":.3f", reduction="max"),
         "samples_per_s": AverageMeter("smp/s", ":.0f"),
     }
+    for param_group in optimizer.param_groups:
+        group_name = param_group.get("group_name")
+        if group_name is not None:
+            metric_name = f"lr/{group_name}"
+            train_metrics[metric_name] = AverageMeter(metric_name, ":0.1e")
     if accelerator.scaler is not None:
         # fp16 only. Identical on every rank (the overflow flag is reduced before the scaler
         # updates), so it needs no reduction — same as grad_norm and lr above. A falling scale
@@ -970,19 +986,22 @@ def train(cfg: TrainPipelineConfig) -> None:
                 if train_tracker.step_s.avg > 0:
                     train_tracker.samples_per_s = samples_per_step / train_tracker.step_s.avg
                 logging.info(train_tracker)
-                if wandb_logger:
+                if wandb_logger or swanlab_logger:
                     # Policy sub-losses (latent_loss, action_loss, ...) are aggregated into the
                     # tracker by update_policy, so to_dict() already carries their windowed,
                     # rank-reduced averages — no per-step output_dict passthrough needed.
-                    wandb_log_dict = train_tracker.to_dict()
+                    train_log_dict = train_tracker.to_dict()
                     # Log sample weighting statistics if enabled
                     if sample_weighter is not None:
                         weighter_stats = sample_weighter.get_stats()
-                        wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
+                        train_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     if ema is not None and ema.cur_decay_value is not None:
-                        wandb_log_dict["ema/decay"] = ema.cur_decay_value
-                        wandb_log_dict["ema/step"] = ema.optimization_step
-                    wandb_logger.log_dict(wandb_log_dict, step)
+                        train_log_dict["ema/decay"] = ema.cur_decay_value
+                        train_log_dict["ema/step"] = ema.optimization_step
+                    if wandb_logger:
+                        wandb_logger.log_dict(train_log_dict, step)
+                    if swanlab_logger:
+                        swanlab_logger.log_dict(train_log_dict, step)
             train_tracker.reset_averages()
 
         if is_eval_step and eval_dataloader is not None:
@@ -1006,6 +1025,8 @@ def train(cfg: TrainPipelineConfig) -> None:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                if swanlab_logger:
+                    swanlab_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file
@@ -1106,10 +1127,13 @@ def train(cfg: TrainPipelineConfig) -> None:
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                if wandb_logger or swanlab_logger:
+                    eval_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    if wandb_logger:
+                        wandb_logger.log_dict(eval_log_dict, step, mode="eval")
+                        wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    if swanlab_logger:
+                        swanlab_logger.log_dict(eval_log_dict, step, mode="eval")
 
             accelerator.wait_for_everyone()
 
@@ -1152,6 +1176,8 @@ def train(cfg: TrainPipelineConfig) -> None:
     # Properly clean up the distributed process group
     accelerator.wait_for_everyone()
     accelerator.end_training()
+    if swanlab_logger:
+        swanlab_logger.finish()
 
 
 def _remote_target_in_argv() -> bool:

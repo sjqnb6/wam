@@ -16,6 +16,7 @@
 
 import logging
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lerobot.streaming.episode_pool import StreamingSamplingStrategy
 from lerobot.transforms import ImageTransformsConfig
@@ -144,6 +145,15 @@ class WandBConfig:
     console_multipart: bool = False
     console_chunk_max_seconds: int = 0
     add_tags: bool = True  # If True, save configuration as tags in the WandB run.
+
+
+@dataclass
+class SwanLabConfig:
+    enable: bool = False
+    project: str = "lerobot"
+    workspace: str | None = None
+    mode: Literal["online", "offline", "local", "disabled"] = "online"
+    run_id: str | None = None
 
 
 @dataclass

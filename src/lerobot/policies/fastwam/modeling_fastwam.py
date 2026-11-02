@@ -325,6 +325,7 @@ class FastWAMPolicy(PreTrainedPolicy):
             raise RuntimeError("FastWAM video LoRA left no trainable action/proprio parameters.")
         groups = [
             {
+                "group_name": "video_lora",
                 "params": video_lora_params,
                 "lr": self.config.optimizer_lr_video_lora,
                 "weight_decay": self.config.optimizer_weight_decay_video_lora,
@@ -333,6 +334,7 @@ class FastWAMPolicy(PreTrainedPolicy):
         if video_patch_embedding_params:
             groups.append(
                 {
+                    "group_name": "video_patch_embedding",
                     "params": video_patch_embedding_params,
                     "lr": self.config.optimizer_lr_video_patch_embedding,
                     "weight_decay": self.config.optimizer_weight_decay,
@@ -340,6 +342,7 @@ class FastWAMPolicy(PreTrainedPolicy):
             )
         groups.append(
             {
+                "group_name": "action_and_proprio",
                 "params": action_and_proprio_params,
                 "lr": self.config.optimizer_lr_action,
                 "weight_decay": self.config.optimizer_weight_decay,
